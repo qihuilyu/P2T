@@ -1,0 +1,1 @@
+{"ptv":{"maskfile": "PTV-composite.npy"},"bbox":{"maskfile": "BODY.npy"},"sad":1000,"fmap_dims":[150,1],"beamlet_size":[2,2],"beamlet_spacing":[2,2],"energy":10, "gps_filename":"gps_squarefield_photon_10MV.mac.tpl", "priority":-100,"extra_args": ["--output-positronannihilation"],"particle_type":"photon","storage-type":"sparse","sparse-threshold":0.0}
