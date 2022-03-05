@@ -1,0 +1,35 @@
+batch_size: 60
+learning_rate: 1.e-3
+nepochs: 150
+
+model:
+  type: unet
+
+  unet:
+    channel_groups:
+      - channels: [dose, geometry]
+        filters: 36
+        scales: 3
+
+optimizer:
+  type: sgd
+
+  sgd:
+    momentum: 0.9
+    nesterov: False
+
+  adam:
+    beta_1: 0.9
+    beta_2: 0.999
+    epsilon: 1.e-07
+
+  rmsprop:
+    rho: 0.9
+    momentum: 0.9
+    epsilon: 1.e-07
+
+loss:
+  type: mse
+
+  mse_tv:
+    tv_weight: 0.3

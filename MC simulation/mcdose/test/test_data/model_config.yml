@@ -1,0 +1,38 @@
+batch_size: 30
+datadir: /data/traindata_5feb2020_5k_8ctx_norm
+learning_rate: 1e-2
+loss:
+  mse_tv:
+    tv_weight: 0
+  type: mse
+memo: null
+model:
+  type: static
+  unet:
+    channel_groups:
+    - channels:
+      - dose
+      filters: 16
+      scales: 3
+nepochs: 200
+optimizer:
+  adam:
+    beta_1: 0.9
+    beta_2: 0.999
+    epsilon: 1.0e-07
+  rmsprop:
+    epsilon: 1.0e-07
+    momentum: 0.9
+    rho: 0.9
+  sgd:
+    momentum: 0.9
+    nesterov: false
+  type: sgd
+sample_weights:
+  exp_norm_sum:
+    decay_rate: 2.0
+  lin_norm_sum: null
+  type: null
+seed: null
+steps_per_epoch: null
+timestamp: 2020-02-06_17:45:55

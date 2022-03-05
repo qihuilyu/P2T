@@ -1,0 +1,2 @@
+FROM mcdose-base AS model
+ENTRYPOINT ["python", "-u", "-m", "mcdose"]

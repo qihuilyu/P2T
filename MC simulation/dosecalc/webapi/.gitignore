@@ -1,0 +1,5 @@
+temp/
+temp_*/
+.env
+venv/
+dosecalc

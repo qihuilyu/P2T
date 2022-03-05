@@ -1,0 +1,2 @@
+FROM mcdose-base AS client
+ENTRYPOINT [ "python", "/src/webapi/client.py" ]

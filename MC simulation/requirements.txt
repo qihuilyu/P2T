@@ -1,0 +1,17 @@
+Cython
+dicom-numpy==0.3.0
+h5py
+numpy
+pathvalidate
+Pillow
+pydicom
+pymongo
+scipy
+tensorflow-addons
+tqdm
+matplotlib
+PyQt5
+PyYAML
+protobuf
+git+https://github.com/ryanneph/raytrace.git@v1.5
+git+https://github.com/ryanneph/rttypes.git@v1.3

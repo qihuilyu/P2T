@@ -1,0 +1,726 @@
+#!/bin/bash
+set -euo pipefail
+CURDIR="$(dirname $(realpath $0))"
+
+#==========================================================================================
+# OVERVIEW
+#
+# This is a high-level wrapper around the distributed MC dose calculation framework that intends to simply
+# its use for standard treatment planning workflows by automating much of the networking and path specification
+# and hiding it behind the scenes
+#
+# The major functions enabled by this wrapper are as follows:
+#   - Creating treatment planning dose files
+#   - Creating anatomy structure masks
+#   - Simulation status monitoring
+#==========================================================================================
+# STATIC CONFIGURATION (set once for a project, and leave it alone)
+PROJECT="dosecalc-pairprod" # try to make this unique to avoid conflicts
+DBDATA="/media/raid1/qlyu/PairProd/dbdata/"
+DBPORT=27099
+#COMPUTE_HOSTS=(shenggpu1 ketosuccess thinkmate1tb)
+COMPUTE_HOSTS=(shenggpu1 shenggpu2 '10.44.114.117' ketosuccess '10.44.114.215' microway thinkmate1tb ryan-thinkstation-d30 shenglab5 shenglab7 shenglab10-desktop shenglab2 Qihui)
+#COMPUTE_HOSTS=(shenggpu1 shenggpu2 '10.44.114.117' ketosuccess '10.44.114.215' microway thinkmate1tb ryan-thinkstation-d30 daili-ThinkStation-D30 shenglab2 shenglab5 shenglab7 shenglab10-desktop shenglab6 Qihui shenglab4)
+#COMPUTE_HOSTS=(shenggpu1 shenggpu2 '10.44.114.117' ketosuccess '10.44.114.215' thinkmate1tb ryan-thinkstation-d30)
+COMPUTE_PORT=6673
+DATASERVER_HOST="$(hostname)"
+DATASERVER_PORT=6674
+LOGLEVEL="DEBUG" # python logging level [options {DEBUG, INFO, WARNING, ERROR, CRITICAL}]
+USER="${USER}"
+GROUP="${USER}"
+#==========================================================================================
+
+# DERIVED CONFIGURATION (don't touch it...)
+USER="$(cut -d: -f3 <(getent passwd ${USER}))"
+GROUP="$(cut -d: -f3 <(getent group ${GROUP}))"
+NETWORK="${PROJECT}"
+MONGOVOL="${PROJECT}-mongo"
+MONGONAME="${PROJECT}-mongo"
+DATASERVERNAME="${PROJECT}-dataserver"
+COMPUTESERVERNAME="${PROJECT}-computeserver"
+DOCKER_IMG_BASE="clouddose" # THIS MUST MATCH THE IMAGE NAME
+DOCKER_IMG_TAG="latest"     # THIS MUST MATCH THE IMAGE VERSION
+DOCKER_IMG_COMPUTE="${DOCKER_IMG_BASE}-compute:${DOCKER_IMG_TAG}"
+DOCKER_IMG_DATA="${DOCKER_IMG_BASE}-data:${DOCKER_IMG_TAG}"
+DOCKER_IMG_CLIENT="${DOCKER_IMG_BASE}-client:${DOCKER_IMG_TAG}"
+if [[ ! -d "${DBDATA}" ]]; then
+    read -p "dbdata directory \"${DBDATA}\" doesn't exist. Would you like to create it [Y/n]? " USERINPUT
+    if [[ "$(echo ${USERINPUT} | tr '[:upper:]' '[:lower:]')" == 'y' ]]; then
+      mkdir -p "${DBDATA}"
+    else
+      local d="$(realpath ./dbdata)"
+      " Defaulting to ${d}"
+      DBDATA="$d"
+    fi
+fi
+
+DOCKER_BASE_CMD="\
+sudo docker run -it \
+  --user ${USER}:${GROUP} \
+  --network ${NETWORK} \
+  --volume $(realpath ${DBDATA}):/dbdata \
+"
+DOCKER_BASE_CMD_MAPCODE="\
+  ${DOCKER_BASE_CMD} \
+  --volume $(realpath ${CURDIR}/webapi):/src/webapi \
+"
+DOCKER_CMD_TEMP="\
+  ${DOCKER_BASE_CMD_MAPCODE} \
+  --rm \
+"
+DOCKER_CMD_PERSISTENT="\
+  ${DOCKER_BASE_CMD_MAPCODE} \
+  --restart always \
+"
+
+function print_error() {
+  >&2 printf '\e[31m%s\e[0m\n' "$@"
+}
+function print_warning() {
+  >&2 printf '\e[33m%s\e[0m\n' "$@"
+}
+function check_output() {
+  # transparently check result code for a given command and print an error message containing
+  # the command's output if the command failed, otherwise just return the same result code
+  local output="$(\
+    2>&1 eval $@ \
+    )"
+  local result_code="$?"
+  # custom check for docker errors, since docker run always returns exit code 0 (thanks for nothing...)
+  echo "$output" | grep -qe "docker: Error" -e "Error response from daemon" && result_code=1
+  if [ "$result_code" -ne 0 ]; then 
+    >&2 echo ">> Error while executing command \"$@\":"
+    printf '>> ERROR MSG: '
+    print_error "${output}"
+  else
+    echo -e "$output"
+  fi
+  return "$result_code"
+}
+
+function docker_create_network() {
+  if ! sudo docker network ls | grep -q "${NETWORK}"; then
+    echo "Creating docker network..."
+    check_output sudo docker network create "${NETWORK}" >/dev/null
+  fi
+}
+function docker_create_volume() {
+  if ! sudo docker volume ls | grep -q "${MONGOVOL}"; then
+    echo "Creating docker database volume..."
+    check_output sudo docker volume create "${MONGOVOL}" >/dev/null
+  fi
+}
+function docker_initialize() {
+  # create dbdata and set permissions
+  sudo mkdir -p "${DBDATA}"
+  echo "Setting ownership and permissions on dbdata folder \"${DBDATA}\"..."
+  sudo chown "${USER}:${GROUP}" -R "${DBDATA}"
+
+  pushd "${CURDIR}/.." >/dev/null
+    echo "Building docker images..."
+    check_output ./docker-build.sh >/dev/null
+  popd >/dev/null
+
+  docker_create_network
+  docker_create_volume
+}
+function get_container_name() {
+  # $1: container id
+  sudo docker container inspect "$1" | grep '"Name": "' | head -n1 | tr -s ' ' | cut -d' ' -f3 | tr -d '/",'
+}
+function is_container_running() {
+  local output="$(sudo docker container inspect $1)"
+  echo "$output" | grep '"Running": true' && \
+  echo "$output" | grep '"Restarting": false' && \
+  echo "$output" | grep '"ExitCode": 0' && \
+  echo "$output" | grep '"RestartCount": 0'
+}
+function docker_checkhealth() {
+  # $@: container_id1 container_id2 ...
+  for container in $@; do
+    container_name="$(get_container_name $container)"
+    if ! is_container_running "${container}" &>/dev/null; then
+      echo ">> ERROR: process ${container_name}" is not running
+      echo ">> LOG OUTPUT:"
+      print_error "$(sudo docker logs $container)"
+      return 1
+    fi
+  done
+  return 0
+}
+function docker_startup_compute() {
+  check_output $DOCKER_CMD_PERSISTENT -d \
+    --name "${COMPUTESERVERNAME}" \
+    --user "$(id -u root):$(id -g root)" \
+    --publish "${COMPUTE_PORT}:${COMPUTE_PORT}" \
+    ${DOCKER_IMG_COMPUTE} \
+    -L"${LOGLEVEL}" --bindport "${COMPUTE_PORT}" 
+}
+function docker_shutdown_on_error() {
+  echo "Problem starting docker environment, shutting down..."
+  docker_shutdown
+  exit 1
+}
+function docker_startup() {
+  trap 'printf "Error encountered on line ${LINENO}:: " ;docker_shutdown_on_error' ERR
+  docker_initialize
+  echo "Starting Database..."
+  container_id_mongo="$(\
+    check_output $DOCKER_CMD_PERSISTENT -d \
+      --name "${MONGONAME}" \
+      --user "$(id -u root):$(id -g root)" \
+      --volume "${MONGOVOL}:/data/db" \
+      --publish "${DBPORT}:${DBPORT}" \
+      mongo --port "${DBPORT}" \
+  )"
+
+  echo "Starting Dataserver..."
+  container_id_dataserver="$(\
+    check_output $DOCKER_CMD_PERSISTENT -d \
+      --name "${DATASERVERNAME}" \
+      --gpus all \
+      --publish "${DATASERVER_PORT}:${DATASERVER_PORT}" \
+      ${DOCKER_IMG_DATA} \
+      --data /dbdata --dbhost "${MONGONAME}" --dbport "${DBPORT}" -L"${LOGLEVEL}" \
+      --computehosts ${COMPUTE_HOSTS[@]} --computeport "${COMPUTE_PORT}" \
+      --bindaddr "${DATASERVER_HOST}" --bindport "${DATASERVER_PORT}" \
+  )"
+
+  echo "Starting Computeserver..."
+  container_id_computeserver="$(docker_startup_compute)"
+
+  echo "Waiting 10s for processes to stabilize..."
+  sleep 10
+  docker_checkhealth "$container_id_mongo" "$container_id_dataserver" "$container_id_computeserver"
+  echo "Done"
+  trap ERR
+}
+function docker_stop_and_rm_container() {
+  sudo docker container stop "$1" && \
+  sudo docker container rm   "$1"
+}
+function docker_shutdown() {
+  echo "Stopping Computeserver..."
+  docker_stop_and_rm_container "${COMPUTESERVERNAME}" &>/dev/null || true
+  echo "Stopping Dataserver..."
+  docker_stop_and_rm_container "${DATASERVERNAME}" &>/dev/null || true
+  echo "Stopping Database..."
+  docker_stop_and_rm_container "${MONGONAME}" &>/dev/null || true
+}
+function docker_cleanup() {
+  echo "Preparing to cleanup docker environment."
+  echo "CAUTION: This will destroy your database and all data within."
+  read -p "Are you sure you want to proceed [y/N]? " USERINPUT
+  if [[ "$(echo ${USERINPUT} | tr '[:upper:]' '[:lower:]')" == 'y' ]]; then
+    echo "Cleaning up..."
+    docker_shutdown
+    echo "Removing network..."
+    sudo docker network rm "${NETWORK}" >/dev/null || true
+    echo "Removing volumes..."
+    sudo docker volume rm "${MONGOVOL}" >/dev/null || true
+    echo "Removing external data files (dbdata: ${DBDATA})"
+    rm -r "${DBDATA}"
+  else
+    echo "Aborting ..."
+  fi
+}
+
+function docker_save_database() {
+  echo "Saving mongo database to compressed file..."
+  docker_shutdown
+  sudo docker run --rm -v $(pwd):/backup -v "${MONGOVOL}:/data/db" busybox tar -czvf /backup/${PROJECT}-database.tar.gz /data/db 2>&1 >/dev/null
+  echo "The database for project=${PROJECT} has been successfully stored in $(pwd)/${PROJECT}-database.tar.gz"
+  echo "To complete the migration, first copy this file to the receiving computer, into"
+  echo "   the directory housing your new simpledose file, then run ./simpledose load-database ${PROJECT}-database.tar.gz."
+  echo "   The database will be imported using the project name you've defined in your new simpledose file"
+  echo "Please restart simpledose when you are ready"
+}
+function docker_load_database() {
+  echo "Loading mongo database from compressed file..."
+  docker_shutdown
+  docker_create_volume
+  sudo docker run --rm -v "${MONGOVOL}":/data/db -v "$(realpath $1):/backup_file" -w / busybox tar -xzvf /backup_file 2>&1 >/dev/null
+  echo "The database in $1 was successfully imported into project=${PROJECT}"
+  echo "Please restart simpledose when you are ready"
+}
+
+function print_targets() {
+  cat << 'ENDHERE'
+  Available Targets (<target>):
+    target                 description
+    -----------            -----------------------------------------------------------
+    create-plan            Initialize a new plan for automated Monte Carlo dosecalc
+    fmaps                  Generate an fmaps.h5 file describing beams/beamlets
+    masks                  Generate a masks.h5 file containing all structure masks
+    exportdata             Generate a sparse data matrix file for any MC generated data
+    export_detection_data  Generate a detection data file for any MC generated data
+    plandose               Generate a sparse planning dose matrix file (spmat.h5)
+    finaldose              Generate a final treatment plan dose and density
+    add-simulation         Add simulation tasks to plan with specific particle counts
+    delete-plan            Delete a plan and all of its associated data (CAUTION)
+    delete-sims            Delete a set of simulations matching filter criteria (ADVANCED)
+    sim-status             List overall simulation tasks status (aggregated)
+    plan-status            List simulation tasks status for each plan
+
+    add-simulation-perbeamlet Add simulation tasks to plan with a searchable "tag" and 
+                              per-beamlet "nparticles" values.
+
+    start                  Initialize docker environment, network, and database
+    stop                   Shutdown docker environment and database
+    restart                Restart docker environment (if params were changed)
+    cleandb                Optimize database by cleaning leftover entries/files
+    uninstall              remove all traces of this code (CAUTION)
+
+    save-database          save the database to file for migration to another dataserver
+    load-database          import a database file into a new project's dataserver instance
+
+    bundle-computeserver   Prepare package for starting other computeservers
+    start-computeserver    Start only a compute server on this machine
+
+    (other)                Print this help message
+ENDHERE
+}
+function print_usage() {
+  echo "usage:  $(basename $0) <target> [target-args]"
+  echo
+  print_targets
+  echo
+  cat << ENDHERE
+  Examples:
+    $(basename $0) create-plan <plan-directory> <plan-name> --nparticles 1000 2000
+    $(basename $0) fmaps       <plan-name> <output-file>
+    $(basename $0) masks       <plan-name> <output-file>
+    $(basename $0) plandose    <plan-name> <output-file> --nparticles 1000
+    $(basename $0) finaldose   <plan-name> <output-folder> --nparticles 1000
+    $(basename $0) delete-plan <plan-name>
+    $(basename $0) plan-status
+    $(basename $0) sim-status  --rate <update-rate-secs>
+ENDHERE
+}
+function target_cleandb() {
+  ${DOCKER_CMD_TEMP} \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" \
+  database --data "/dbdata" \
+  --dbhost "${MONGONAME}" --dbport "${DBPORT}" \
+  cleandb --action all
+}
+function target_create_plan() {
+  local CTROOT="${1:-}"; shift || true
+  local DOI="${1:-}"; shift || true
+  local ARGS="$@"
+  if [[ -z "$CTROOT" || -z "$DOI" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-directory> <plan-name> [--nparticles N [N ...]]" 
+    exit 1
+  fi
+
+  echo "plan-directory:  $CTROOT"
+  echo "plan-name:       $DOI"
+  ${DOCKER_CMD_TEMP} \
+  --volume "$(realpath $CTROOT):/input" \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" --dsaddr "${DATASERVERNAME}" --dsport "${DATASERVER_PORT}" \
+  restapi create_plan /input --doi "${DOI}" ${ARGS}
+}
+function target_add_simulation() {
+  local DOI="${1:-}"; shift || true
+  local ARGS="$@"
+  if [[ -z "$DOI" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name> --nparticles N [N ...]"
+    exit 1
+  fi
+
+  echo "plan-name:       $DOI"
+  ${DOCKER_CMD_TEMP} \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" --dsaddr "${DATASERVERNAME}" --dsport "${DATASERVER_PORT}" \
+  restapi add_simulation --doi "${DOI}" ${ARGS}
+}
+function target_add_simulation_perbeamlet() {
+  local DOI="${1:-}"; shift || true
+
+  PARAMS=""
+  nparticles_file=""
+  while (( "$#" )); do
+    case $1 in
+      --nparticles-file)
+        nparticles_file="$(realpath $2)" || { echo "--nparticles_file must point to a real file"; exit 1; }
+        shift 2
+        ;;
+      *)
+        PARAMS="$PARAMS $1"
+        shift
+        ;;
+    esac
+  done
+  eval set -- "$PARAMS"
+
+  local ARGS="$@"
+  if [[ -z "$DOI" ]] || [[ -z "$nparticles_file" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name> --tag <tag-string> --nparticles-file <path-to-file.txt>"
+    exit 1
+  fi
+
+  echo "plan-name:       $DOI"
+  ${DOCKER_CMD_TEMP} \
+  --volume "$(dirname $nparticles_file):/input" \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" --dsaddr "${DATASERVERNAME}" --dsport "${DATASERVER_PORT}" \
+  restapi add_simulation_perbeamlet --doi "${DOI}" --nparticles-file "/input/$(basename ${nparticles_file})" ${ARGS}
+}
+function target_fmaps() {
+  local DOI="${1:-}"
+  local OUTPUT="${2:-}"
+  if [[ -z "$DOI" || -z "$OUTPUT" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name> <output-file>"
+    exit 1
+  fi
+
+  local OUTPUT="$(realpath ${OUTPUT})"
+  local outdir="$(dirname ${OUTPUT})"
+  local outbase="$(basename ${OUTPUT})"
+
+  echo "plan-name:    $DOI"
+  echo "output-file:  $OUTPUT"
+  ${DOCKER_CMD_TEMP} \
+  --volume "${outdir}:/output" \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" \
+  database --dbhost "${MONGONAME}" --dbport "${DBPORT}" --data /dbdata \
+  generate fmaps --image_doi "${DOI}" --out "/output/${outbase}"
+  echo "Saved fmaps file to ${OUTPUT}"
+}
+function target_masks() {
+  local DOI="${1:-}"
+  local OUTPUT="${2:-}"
+  if [[ -z "$DOI" || -z "$OUTPUT" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name> <output-file>"
+    exit 1
+  fi
+
+  local OUTPUT="$(realpath ${OUTPUT})"
+  local outdir="$(dirname ${OUTPUT})"
+  local outbase="$(basename ${OUTPUT})"
+
+  echo "plan-name:    $DOI"
+  echo "output-file:  $OUTPUT"
+  ${DOCKER_CMD_TEMP} \
+  --volume "${outdir}:/output" \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" \
+  database --dbhost "${MONGONAME}" --dbport "${DBPORT}" --data /dbdata \
+  generate masks --image_doi "${DOI}" --out "/output/${outbase}"
+  echo "Saved masks file to ${OUTPUT}"
+}
+function target_exportdata() {
+  local DOI="${1:-}"; shift || true
+  local DATA_NAME="${1:-}"; shift || true
+  local OUTPUT="${1:-}"; shift || true
+  local ARGS="$@"
+  if [[ -z "$DOI" || -z "${DATA_NAME}" || -z "$OUTPUT" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name> <data-filename> <output-file> [--nparticles <N>] [--drop_thresh <thresh>] [args ...]"
+    exit 1
+  fi
+
+  local OUTPUT="$(realpath ${OUTPUT})"
+  local outdir="$(dirname ${OUTPUT})"
+  local outbase="$(basename ${OUTPUT})"
+
+  echo "plan-name:     $DOI"
+  echo "data-filename: ${DATA_NAME}"
+  echo "output-file:   $OUTPUT"
+  ${DOCKER_CMD_TEMP} \
+  --volume "${outdir}:/output" \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" \
+  database --dbhost "${MONGONAME}" --dbport "${DBPORT}" --data /dbdata \
+  generate exportdata --image_doi "${DOI}" --name "${DATA_NAME}" --out "/output/${outbase}" ${ARGS}
+  echo "Saved data file to ${OUTPUT}"
+}
+function target_export_detection_data() {
+  local DOI="${1:-}"; shift || true
+  local DATA_NAME="${1:-}"; shift || true
+  local OUTPUT="${1:-}"; shift || true
+  local ARGS="$@"
+  if [[ -z "$DOI" || -z "${DATA_NAME}" || -z "$OUTPUT" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name> <data-filename> <output-file> [--nparticles <N>] [--drop_thresh <thresh>] [args ...]"
+    exit 1
+  fi
+
+  local OUTPUT="$(realpath ${OUTPUT})"
+  local outdir="$(dirname ${OUTPUT})"
+  local outbase="$(basename ${OUTPUT})"
+
+  echo "plan-name:     $DOI"
+  echo "data-filename: ${DATA_NAME}"
+  echo "output-file:   $OUTPUT"
+  ${DOCKER_CMD_TEMP} \
+  --volume "${outdir}:/output" \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" \
+  database --dbhost "${MONGONAME}" --dbport "${DBPORT}" --data /dbdata \
+  generate export_detection_data --image_doi "${DOI}" --name "${DATA_NAME}" --out "/output/${outbase}" ${ARGS}
+  echo "Saved data file to ${OUTPUT}"
+}
+function target_plandose() {
+  local DOI="${1:-}"; shift || true
+  local OUTPUT="${1:-}"; shift || true
+  local ARGS="$@"
+  if [[ -z "$DOI" || -z "$OUTPUT" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name> <output-file> [--nparticles <N>] [--drop_thresh <thresh>] [args ...]"
+    exit 1
+  fi
+
+  local OUTPUT="$(realpath ${OUTPUT})"
+  local outdir="$(dirname ${OUTPUT})"
+  local outbase="$(basename ${OUTPUT})"
+
+  echo "plan-name:    $DOI"
+  echo "output-file:  $OUTPUT"
+  ${DOCKER_CMD_TEMP} \
+  --volume "${outdir}:/output" \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" \
+  database --dbhost "${MONGONAME}" --dbport "${DBPORT}" --data /dbdata \
+  generate exportdata --image_doi "${DOI}" --out "/output/${outbase}" ${ARGS}
+  echo "Saved dose file to ${OUTPUT}"
+}
+function target_finaldose() {
+  local DOI="${1:-}"; shift || true
+  local OUTPUT="${1:-}"; shift || true
+  local ARGS="$@"
+  if [[ -z "$DOI" || -z "$OUTPUT" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name> <output-folder> [--nparticles <N>] [args ...]"
+    exit 1
+  fi
+
+  local OUTPUT="$(realpath ${OUTPUT})"
+
+  echo "plan-name:    $DOI"
+  echo "output-folder:  $OUTPUT"
+  mkdir -p "${OUTPUT}"
+  ${DOCKER_CMD_TEMP} \
+  --volume "${OUTPUT}:/output" \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" \
+  database --dbhost "${MONGONAME}" --dbport "${DBPORT}" --data /dbdata \
+  generate finaldose --image_doi "${DOI}" --out "/output/" ${ARGS}
+  echo "Saved files to ${OUTPUT}"
+}
+function target_delete_plan() {
+  local FORCE=0
+  local PARAMS=""
+  while (( "$#" )); do
+    case "$1" in
+      -f|--force)
+        FORCE=1
+        shift
+        ;;
+      *)
+        PARAMS="$PARAMS $1"
+        shift
+        ;;
+    esac
+  done
+  eval set -- "$PARAMS"
+
+  local DOI="${1:-}"
+  if [[ -z "$DOI" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name>"
+    exit 1
+  fi
+  shift
+  
+  echo "plan-name:   ${DOI}"
+  if [[ "$FORCE" != 1 ]]; then
+    echo "CAUTION: Deleting this plan will result in loss of all data associated with the plan"
+    read -p "Are you sure you want to proceed [y/N]? " USERINPUT
+    if [[ "$(echo ${USERINPUT} | tr '[:upper:]' '[:lower:]')" != 'y' ]]; then
+      echo "Aborting ..."
+      exit 1
+    fi
+  fi
+
+  echo "Deleting plan \"${DOI}\"..." 
+  ${DOCKER_CMD_TEMP} \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" --dsaddr "${DATASERVERNAME}" --dsport "${DATASERVER_PORT}" \
+  restapi image delete --doi "${DOI}"
+}
+function target_delete_sims() {
+  local FORCE=0
+  local PARAMS=""
+  while (( "$#" )); do
+    case "$1" in
+      -f|--force)
+        FORCE=1
+        shift
+        ;;
+      *)
+        PARAMS="$PARAMS $1"
+        shift
+        ;;
+    esac
+  done
+  eval set -- "$PARAMS"
+
+  local DOI="${1:-}"
+  if [[ -z "$DOI" ]]; then
+    echo "usage:  $(basename $0) ${TARGET} <plan-name> [--tag <tag>] [args]"
+    exit 1
+  fi
+  shift
+
+  echo "plan-name:     ${DOI}"
+  echo "addtl. args:   $@"
+  if [[ "$FORCE" != 1 ]]; then
+    echo "CAUTION: Deleting this simulation set will result in loss of all associated data."
+    read -p "Are you sure you want to proceed [y/N]? " USERINPUT
+    if [[ "$(echo ${USERINPUT} | tr '[:upper:]' '[:lower:]')" != 'y' ]]; then
+      echo "Aborting ..."
+      exit 1
+    fi
+  fi
+
+  echo "Deleting sims..."
+
+  ${DOCKER_CMD_TEMP} \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" --dsaddr "${DATASERVERNAME}" --dsport "${DATASERVER_PORT}" \
+  restapi delete_simulations --doi "${DOI}" $@
+}
+function target_sim_status() {
+  ${DOCKER_CMD_TEMP} \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" --dsaddr "${DATASERVERNAME}" --dsport "${DATASERVER_PORT}" \
+  status --csaddr ${COMPUTE_HOSTS[@]} --csport "${COMPUTE_PORT}" $@
+}
+function target_plan_status() {
+  ${DOCKER_CMD_TEMP} \
+  ${DOCKER_IMG_CLIENT} \
+  -L"${LOGLEVEL}" --dsaddr "${DATASERVERNAME}" --dsport "${DATASERVER_PORT}" \
+  plan_status $@
+}
+function target_bundle_computeserver {
+  # bundle image and scripts for initializing computeservers
+  echo "Creating computeserver initialization package..."
+  pushd "${CURDIR}" >/dev/null 2>&1
+    local archive_dir="$(basename $0)_compute/"
+    mkdir -p "${archive_dir}" >/dev/null 2>&1
+    cp "$0" "${archive_dir}" >/dev/null 2>&1
+    printf "Saving docker image..."
+    sudo docker save -o "${archive_dir}/computeserver.img.tar" ${DOCKER_IMG_COMPUTE}
+    sudo chown "${USER}:${GROUP}" "${archive_dir}/computeserver.img.tar"
+    echo "done"
+    printf "bundling necessary files..."
+    tar -cf computeserver.bundle.tar "${archive_dir}"
+    rm -r "${archive_dir}" >/dev/null 2>&1
+    echo "done"
+  popd >/dev/null 2>&1
+  echo -e "Finished creating computeserver initialization package.\n"
+  echo -e "\
+To start a compute process on another computer:\n\
+  1. copy computeserver.bundle.tar to the target computer\n\
+  2. unpack the bundle:  tar -xvf computeserver.bundle.tar\n\
+  3. open the directory and run:  ./simpledose start-computeserver"
+}
+function target_start_computeserver() {
+  pushd "${CURDIR}" >/dev/null 2>&1
+    echo "Loading computeserver image..."
+    sudo docker load -q >/dev/null 2>&1 < ./computeserver.img.tar
+  popd >/dev/null 2>&1
+
+  echo "Starting computeserver..."
+  docker_stop_and_rm_container "${COMPUTESERVERNAME}" &>/dev/null || true
+  check_output sudo docker run -it \
+    --restart always -d \
+    --name "${COMPUTESERVERNAME}" \
+    --publish "${COMPUTE_PORT}:${COMPUTE_PORT}" \
+    ${DOCKER_IMG_COMPUTE} \
+    -L"${LOGLEVEL}" --bindport "${COMPUTE_PORT}" >/dev/null
+
+  echo "Waiting 10s for process to stabilize..."
+  sleep 10
+  if ! is_container_running "${COMPUTESERVERNAME}"; then
+    echo "ERROR: computeserver failed to start"
+    exit 1
+  fi
+  echo "Done"
+}
+
+TARGET="${1:-}"; shift || true
+case "$TARGET" in 
+  startup|start)
+    docker_startup
+    ;;
+  shutdown|stop)
+    docker_shutdown
+    ;;
+  restart)
+    docker_shutdown
+    docker_startup
+    ;;
+  cleandb)
+    target_cleandb
+    ;;
+  uninstall)
+    docker_cleanup
+    ;;
+  save-database|save_database)
+    docker_save_database
+    ;;
+  load-database|load_database)
+    docker_load_database $@
+    ;;
+
+  bundle-computeserver|bundle_computeserver)
+    target_bundle_computeserver
+    ;;
+  start-computeserver|start_computeserver)
+    target_start_computeserver
+    ;;
+
+  create-plan|create_plan)
+    target_create_plan $@
+    ;;
+  add-simulation|add_simulation)
+    target_add_simulation $@
+    ;;
+  add-simulation-perbeamlet|add_simulation_perbeamlet)
+    target_add_simulation_perbeamlet $@
+    ;;
+  fmaps)
+    target_fmaps $@
+    ;;
+  masks)
+    target_masks $@
+    ;;
+  exportdata)
+    target_exportdata $@
+    ;;
+  export_detection_data)
+    target_export_detection_data $@
+    ;;
+  plandose)
+    target_plandose $@
+    ;;
+  finaldose)
+    target_finaldose $@
+    ;;
+  delete-plan|delete_plan)
+    target_delete_plan $@
+    ;;
+  delete-sims|delete_sims)
+    target_delete_sims $@
+    ;;
+  sim-status|sim_status)
+    target_sim_status $@
+    ;;
+  plan-status|plan_status)
+    target_plan_status $@
+    ;;
+  *)
+    print_usage
+    exit 0
+    ;;
+esac

@@ -1,0 +1,12 @@
+docker-compose.yml
+build/
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+.ycm_extra_conf.py
+*.npy
+*.log
+temp/
+*.tar
+.simpledose
+.setup_computeserver.sh

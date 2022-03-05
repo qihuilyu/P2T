@@ -1,0 +1,88 @@
+version: '3.4'
+
+services:
+  mongo:
+    image: mongo
+    restart: always
+    ports:
+      - 27099:27017
+    volumes:
+      - "mongodb:/data/db"
+    environment:
+      TZ: $TZ
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpass
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+
+  # mongo-express:
+  #   image: mongo-express
+  #   restart: always
+  #   ports:
+  #     - 8081:8081
+  #   environment:
+  #     TZ: $TZ
+  #     ME_CONFIG_MONGODB_SERVER: mongo
+  #     ME_CONFIG_MONGODB_PORT: 27017
+  #     ME_CONFIG_MONGODB_ADMINUSERNAME: root
+  #     ME_CONFIG_MONGODB_ADMINPASSWORD: rootpass
+  #   deploy:
+  #     placement:
+  #       constraints: [node.role == manager]
+
+#----------------
+
+  manager:
+    image: $TAG_DATA_REMOTE
+    build:
+      context: ./
+      dockerfile: Dockerfile-data
+    restart: always
+    volumes:
+      - /etc/hostname:/etc/host_hostname:ro
+      - "/media/hdd2/g4sim/data:/data"
+    environment:
+      TZ: $TZ
+      DS_HOST: manager # reply address for completed simulations
+      CS_HOST: compute # swarm load balancing entrypoint for sending sims to computeservers
+      DB_HOST: mongo
+      DB_NAME: data
+      DB_AUTH: "root rootpass"
+    ports:
+      - 5567:5567
+    command: ["--data", "/data/"]
+    deploy:
+      # endpoint_mode: dnsrr
+      placement:
+        constraints: [node.role == manager]
+
+
+  compute:
+    image: $TAG_COMPUTE_REMOTE
+    build:
+      context: ./
+      dockerfile: Dockerfile-compute
+    volumes:
+      - /etc/hostname:/etc/host_hostname:ro
+    environment:
+      TZ: $TZ
+    ports:
+      - target: 5566
+        published: 5566
+        protocol: tcp
+        # mode: host
+    command: ["--data", "/data/"]
+    deploy:
+      mode: global
+      update_config:
+        parallelism: 3
+        delay: 0s
+        order: stop-first
+      # endpoint_mode: dnsrr
+      placement:
+        constraints: [node.role == worker]
+
+volumes:
+  mongodb:
+    name: dosesim_mongodb

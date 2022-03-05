@@ -1,0 +1,11 @@
+syntax = "proto2";
+package detection;
+message pbDetectionEvent {
+  required double globalTime = 1;
+  required int32  eventId    = 2;
+  required int32  detectorId = 3;
+  required double energy     = 4;
+}
+message pbDetectedEvents {
+  repeated pbDetectionEvent detectionEvent = 1;
+}

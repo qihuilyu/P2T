@@ -1,0 +1,7 @@
+*
+
+!webapi/
+webapi/test
+webapi/venv
+
+!montecarlo/docker-build/binaries/

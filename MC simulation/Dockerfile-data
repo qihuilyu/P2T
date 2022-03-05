@@ -1,0 +1,2 @@
+FROM mcdose-base AS manager
+ENTRYPOINT [ "python", "/src/webapi/dataserver.py" ]
